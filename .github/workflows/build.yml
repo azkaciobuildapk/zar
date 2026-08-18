@@ -1,0 +1,475 @@
+name: Build APK - Flutter / Native Android / Web
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL ZIP project (Flutter / Android / Web)"
+        required: true
+      tag:
+        description: "Tag build"
+        required: true
+      build_type:
+        description: "debug / release"
+        required: true
+        default: "release"
+      only_analyze:
+        description: "Hanya analisis, jangan build (true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.console=plain"
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Download project ZIP
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "========== DOWNLOAD =========="
+          curl -fL --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            "${{ github.event.inputs.zip_url }}" \
+            -o project.zip \
+            2>&1 | tee download.log
+
+          echo "HTTP/file information:"
+          ls -lh project.zip
+          file project.zip
+          echo "SHA256:"
+          sha256sum project.zip
+          echo "First bytes:"
+          xxd -l 64 project.zip || true
+
+      - name: Extract and detect project type
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          echo "========== ZIP VALIDATION ==========" | tee logs/detect.log
+
+          if ! unzip -t project.zip 2>&1 | tee -a logs/detect.log; then
+            echo "ERROR: ZIP tidak valid." | tee -a logs/detect.log
+            exit 1
+          fi
+
+          rm -rf project_raw
+          unzip -q project.zip -d project_raw
+
+          echo "========== EXTRACTED FILES ==========" | tee -a logs/detect.log
+          find project_raw -maxdepth 4 -type f -print | sort | head -300 | tee -a logs/detect.log
+
+          # Jika ZIP hanya berisi satu folder, gunakan folder tersebut sebagai root.
+          roots=(project_raw/*)
+          if [ "${#roots[@]}" -eq 1 ] && [ -d "${roots[0]}" ]; then
+            PROJECT_DIR="${roots[0]}"
+          else
+            PROJECT_DIR="project_raw"
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" | tee -a logs/detect.log
+
+          # Cari root sebenarnya jika index.html/pubspec/gradlew berada satu level lebih dalam.
+          if [ ! -f "$PROJECT_DIR/pubspec.yaml" ] && \
+             [ ! -f "$PROJECT_DIR/gradlew" ] && \
+             [ ! -f "$PROJECT_DIR/index.html" ]; then
+            candidate="$(find "$PROJECT_DIR" -maxdepth 3 \
+              \( -name pubspec.yaml -o -name gradlew -o -name index.html \) \
+              -print -quit | xargs -r dirname)"
+            if [ -n "$candidate" ] && [ -d "$candidate" ]; then
+              PROJECT_DIR="$candidate"
+            fi
+          fi
+
+          echo "FINAL_PROJECT_DIR=$PROJECT_DIR" | tee -a logs/detect.log
+
+          if [ -f "$PROJECT_DIR/pubspec.yaml" ]; then
+            TYPE="flutter"
+          elif [ -f "$PROJECT_DIR/gradlew" ] || [ -f "$PROJECT_DIR/settings.gradle" ] || [ -f "$PROJECT_DIR/settings.gradle.kts" ]; then
+            TYPE="native"
+          elif [ -f "$PROJECT_DIR/index.html" ]; then
+            TYPE="web"
+          else
+            # Web project kadang tidak punya index.html di root.
+            web_entry="$(find "$PROJECT_DIR" -maxdepth 3 -type f \
+              \( -name index.htm -o -name '*.html' \) -print -quit)"
+            if [ -n "$web_entry" ]; then
+              TYPE="web"
+            else
+              TYPE="unknown"
+            fi
+          fi
+
+          echo "PROJECT_TYPE=$TYPE" | tee -a logs/detect.log
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "PROJECT_TYPE=$TYPE" >> "$GITHUB_ENV"
+
+          if [ "$TYPE" = "unknown" ]; then
+            echo "ERROR: Project tidak dikenali." | tee -a logs/detect.log
+            exit 1
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Flutter
+        if: env.PROJECT_TYPE == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.9"
+          channel: stable
+          cache: true
+
+      - name: Environment diagnostics
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          {
+            echo "========== ENVIRONMENT =========="
+            date -u
+            uname -a
+            java -version
+            echo "--- Gradle ---"
+            gradle --version || true
+            echo "--- Android SDK ---"
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            sdkmanager --list_installed 2>/dev/null | head -100 || true
+            echo "--- Flutter ---"
+            flutter --version 2>/dev/null || true
+            echo "--- Project ---"
+            echo "TYPE=$PROJECT_TYPE"
+            echo "DIR=$PROJECT_DIR"
+          } 2>&1 | tee logs/environment.log
+
+      - name: Analyze Flutter project
+        if: env.PROJECT_TYPE == 'flutter'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+          {
+            echo "========== FLUTTER ANALYZE =========="
+            flutter pub get
+            flutter analyze -v
+          } 2>&1 | tee "$GITHUB_WORKSPACE/logs/flutter-analyze.log"
+          true
+
+      - name: Analyze native Android project
+        if: env.PROJECT_TYPE == 'native'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+          {
+            echo "========== NATIVE ANDROID ANALYZE =========="
+            if [ -f gradlew ]; then
+              chmod +x gradlew
+              ./gradlew tasks --all --stacktrace --info
+            else
+              gradle tasks --all --stacktrace --info
+            fi
+          } 2>&1 | tee "$GITHUB_WORKSPACE/logs/native-analyze.log"
+          true
+
+      - name: Analyze web project
+        if: env.PROJECT_TYPE == 'web'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+          {
+            echo "========== WEB PROJECT ANALYZE =========="
+            echo "HTML files:"
+            find . -type f -iname '*.html' -print | sort
+            echo "JavaScript files:"
+            find . -type f \( -iname '*.js' -o -iname '*.mjs' \) -print | sort
+            echo "CSS files:"
+            find . -type f -iname '*.css' -print | sort
+            echo "Package files:"
+            find . -maxdepth 2 -type f \( -name package.json -o -name vite.config.* -o -name webpack.config.* \) -print
+            echo "Entry:"
+            test -f index.html && echo "index.html ditemukan" || echo "PERINGATAN: index.html tidak ada di root"
+          } 2>&1 | tee "$GITHUB_WORKSPACE/logs/web-analyze.log"
+          true
+
+      - name: Stop if analyze-only
+        if: github.event.inputs.only_analyze == 'true'
+        shell: bash
+        run: |
+          echo "Analyze-only mode aktif."
+          exit 0
+
+      # ============================================================
+      # WEB -> APK
+      # Membuat shell Android WebView otomatis tanpa pubspec.yaml.
+      # Semua HTML/CSS/JS/assets dimasukkan ke app/src/main/assets/web.
+      # ============================================================
+      - name: Generate Android wrapper for Web project
+        if: env.PROJECT_TYPE == 'web'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/logs"
+          {
+            echo "========== GENERATE WEB -> APK WRAPPER =========="
+
+            rm -rf "$GITHUB_WORKSPACE/web_apk_wrapper"
+            mkdir -p "$GITHUB_WORKSPACE/web_apk_wrapper/app/src/main/java/com/autobuild/webapk"
+            mkdir -p "$GITHUB_WORKSPACE/web_apk_wrapper/app/src/main/assets/web"
+
+            # Salin semua file web, termasuk folder tersembunyi yang relevan.
+            cp -a . "$GITHUB_WORKSPACE/web_apk_wrapper/app/src/main/assets/web/"
+            rm -rf "$GITHUB_WORKSPACE/web_apk_wrapper/app/src/main/assets/web/.git"
+
+            cat > "$GITHUB_WORKSPACE/web_apk_wrapper/settings.gradle" <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WebToApk"
+          include(":app")
+          EOF
+
+            cat > "$GITHUB_WORKSPACE/web_apk_wrapper/build.gradle" <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.6.1' apply false
+          }
+          EOF
+
+            cat > "$GITHUB_WORKSPACE/web_apk_wrapper/gradle.properties" <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+            cat > "$GITHUB_WORKSPACE/web_apk_wrapper/app/build.gradle" <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.autobuild.webapk'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.autobuild.webapk'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.7.0'
+              implementation 'androidx.webkit:webkit:1.13.0'
+          }
+          EOF
+
+            cat > "$GITHUB_WORKSPACE/web_apk_wrapper/app/src/main/AndroidManifest.xml" <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:theme="@style/AppTheme"
+                  android:label="Web APK"
+                  android:usesCleartextTraffic="true"
+                  android:hardwareAccelerated="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="unspecified">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+            mkdir -p "$GITHUB_WORKSPACE/web_apk_wrapper/app/src/main/res/values"
+            cat > "$GITHUB_WORKSPACE/web_apk_wrapper/app/src/main/res/values/styles.xml" <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:windowActionModeOverlay">true</item>
+                  <item name="android:colorAccent">#C62828</item>
+              </style>
+          </resources>
+          EOF
+
+            cat > "$GITHUB_WORKSPACE/web_apk_wrapper/app/src/main/java/com/autobuild/webapk/MainActivity.java" <<'EOF'
+          package com.autobuild.webapk;
+
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+              private WebView webView;
+
+              @SuppressLint("SetJavaScriptEnabled")
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  webView = new WebView(this);
+                  setContentView(webView);
+
+                  WebSettings s = webView.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setDatabaseEnabled(true);
+                  s.setAllowFileAccess(true);
+                  s.setAllowContentAccess(true);
+                  s.setBuiltInZoomControls(false);
+                  s.setDisplayZoomControls(false);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebChromeClient(new WebChromeClient());
+                  webView.loadUrl("file:///android_asset/web/index.html");
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView.canGoBack()) webView.goBack();
+                  else super.onBackPressed();
+              }
+          }
+          EOF
+
+            cd "$GITHUB_WORKSPACE/web_apk_wrapper"
+            gradle wrapper --gradle-version 8.7 --distribution-type bin
+            echo "Wrapper generated."
+          } 2>&1 | tee "$GITHUB_WORKSPACE/logs/web-to-apk-generate.log"
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+
+          {
+            echo "========== BUILD =========="
+            echo "Project type: $PROJECT_TYPE"
+            echo "Build type: $BUILD_TYPE"
+
+            if [ "$PROJECT_TYPE" = "flutter" ]; then
+              cd "$PROJECT_DIR"
+              if [ "$BUILD_TYPE" = "debug" ]; then
+                flutter build apk --debug -v
+              else
+                flutter build apk --release -v
+              fi
+
+            elif [ "$PROJECT_TYPE" = "native" ]; then
+              cd "$PROJECT_DIR"
+              chmod +x gradlew 2>/dev/null || true
+              if [ "$BUILD_TYPE" = "debug" ]; then
+                ./gradlew assembleDebug --stacktrace --info --console=plain
+              else
+                ./gradlew assembleRelease --stacktrace --info --console=plain
+              fi
+
+            elif [ "$PROJECT_TYPE" = "web" ]; then
+              cd "$GITHUB_WORKSPACE/web_apk_wrapper"
+              chmod +x gradlew
+              if [ "$BUILD_TYPE" = "debug" ]; then
+                ./gradlew assembleDebug --stacktrace --info --console=plain
+              else
+                ./gradlew assembleRelease --stacktrace --info --console=plain
+              fi
+            fi
+          } 2>&1 | tee "$GITHUB_WORKSPACE/logs/build-full.log"
+
+      - name: Collect APK and logs
+        if: always()
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p output logs
+
+          echo "========== APK SCAN ==========" | tee logs/apk-scan.log
+          find "$GITHUB_WORKSPACE" -type f -name '*.apk' \
+            -not -path '*/.gradle/*' \
+            -print | tee -a logs/apk-scan.log || true
+
+          APK_FOUND="$(find "$GITHUB_WORKSPACE" -type f -name '*.apk' \
+            -not -path '*/.gradle/*' | head -n 1 || true)"
+
+          if [ -n "$APK_FOUND" ]; then
+            cp "$APK_FOUND" "output/app-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}.apk"
+            echo "APK=$APK_FOUND" | tee -a logs/apk-scan.log
+            ls -lh "$APK_FOUND" output/*.apk
+          else
+            echo "NO APK FOUND" | tee -a logs/apk-scan.log
+          fi
+
+          echo "========== ALL LOG FILES =========="
+          find logs -type f -maxdepth 2 -print | sort
+          echo "========== ERROR/EXCEPTION SUMMARY ==========" | tee logs/error-summary.log
+          grep -RniE 'error:|error |exception|failed|failure|FAILURE|BUILD FAILED|Execution failed|Could not resolve|Could not find|A problem occurred|^Caused by:' logs \
+            | head -1000 | tee -a logs/error-summary.log || true
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
+          path: output/*.apk
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload FULL build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.event.inputs.tag }}
+          path: |
+            logs/
+            ${{ env.PROJECT_DIR }}/**/build/**/*.log
+          retention-days: 7
+          if-no-files-found: warn
